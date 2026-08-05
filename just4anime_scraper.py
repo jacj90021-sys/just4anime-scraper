@@ -36,12 +36,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # Servers we can resolve. kai/zeke from their own embeds; jin from just4anime's
 # own resolved proxy url (correct anime/ep, no guessed IDs).
-# ryuk DROPPED: just4anime's ryuk->animegg mapping is mislabeled upstream
-# (e.g. Black Clover ep1 returns the "Your Name" movie). Plays, but wrong anime.
+# ryuk: resolved OURSELVES from animegg.org (just4anime's ryuk mapping is
+# mislabeled upstream for some shows -> wrong anime). See _ryuk_real().
 SERVER_TYPES = {
     "kai":  ["sub", "hsub", "dub"],
     "zeke": ["sub", "hsub", "dub"],
     "jin":  ["sub", "dub"],
+    "ryuk": ["sub", "dub", "hsub"],
 }
 
 
@@ -88,14 +89,74 @@ def _embed_m3u8(iframe_url):
     return None, None
 
 
-def resolve(anilist_id, episode, server=None, typ=None):
+# ---------------------------------------------------------------------------
+# ryuk: just4anime's own ryuk->animegg mapping is MISLABELED upstream for some
+# shows (e.g. Black Clover ep1 -> "Your Name" movie). So we resolve ryuk OURSELVES
+# straight from animegg.org using its correct slug-based episode pages:
+#   series slug -> /<slug>-episode-<N> -> /embed/<id> -> /play/<id>/video.mp4
+# We prefer just4anime's episode.id slug (it's already animegg's romaji format and
+# correct for most shows); if that's corrupt or fails, fall back to the anime title.
+# ---------------------------------------------------------------------------
+def _animegg_slug_from_title(title):
+    """best-effort english-title -> animegg slug (lowercase, hyphenated)."""
+    if not title:
+        return None
+    s = title.lower()
+    s = re.sub(r"[^a-z0-9\s\-]", "", s)
+    s = re.sub(r"\s+", "-", s.strip())
+    return s or None
+
+
+def _ryuk_real(anilist_id, episode, just4_id_slug, title):
+    """Return (mp4_url, referer) for the CORRECT animegg episode, or (None, None)."""
+    referer = "https://animegg.org/"
+    # Build candidate series slugs:
+    #   1) from just4anime's episode.id (strip -episode-N / $ep-N)
+    #   2) from the anime title
+    candidates = []
+    if just4_id_slug:
+        base = re.split(r"(?:-episode-|\$ep-|\-ep\d|/ep)", just4_id_slug)[0]
+        base = base.strip("-$").strip()
+        if base and "your-name" not in base and "kimi-no-na-wa" not in base:
+            candidates.append(base)
+    tslug = _animegg_slug_from_title(title)
+    if tslug:
+        candidates += [tslug, tslug + "-tv", tslug + "-dub", re.sub(r"[:.]", "", tslug)]
+    # de-dup, keep order
+    seen, ordered = set(), []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    for slug in ordered:
+        try:
+            page = _get(f"https://www.animegg.org/{slug}-episode-{episode}",
+                        referer=referer)
+        except Exception:
+            continue
+        m = re.search(r"/embed/(\d+)", page)
+        if not m:
+            continue
+        embed_id = m.group(1)
+        try:
+            emb = _get(f"https://www.animegg.org/embed/{embed_id}", referer=referer)
+        except Exception:
+            continue
+        mp = re.search(r"/play/(\d+)/video\.mp4\?for=(\d+)", emb)
+        if mp:
+            url = f"https://www.animegg.org/play/{mp.group(1)}/video.mp4?for={mp.group(2)}"
+            return url, referer
+    return None, None
+
+
+def resolve(anilist_id, episode, server=None, typ=None, title=None):
     results = []
     servers = [server] if server else list(SERVER_TYPES.keys())
     for srv in servers:
         types = [typ] if typ else SERVER_TYPES.get(srv, [])
         for t in types:
-            data = _api_sources(anilist_id, episode, srv, t)
-            if not data:
+            data = _api_sources(anilist_id, episode, srv, t) if srv != "ryuk" else None
+            if srv != "ryuk" and not data:
                 continue
             # kai/zeke: resolve from their own embed
             if srv in ("kai", "zeke"):
@@ -106,9 +167,9 @@ def resolve(anilist_id, episode, server=None, typ=None):
                 if not url:
                     continue
                 fmt, is_m = "hls", True
-            else:
-                # jin/ryuk: use just4anime's OWN resolved url + referer (correct anime/ep)
-                srcs = data.get("sources") or []
+            elif srv == "jin":
+                # jin: use just4anime's OWN resolved url + referer (correct anime/ep)
+                srcs = (data or {}).get("sources") or []
                 if not srcs:
                     continue
                 s = srcs[0]
@@ -117,14 +178,19 @@ def resolve(anilist_id, episode, server=None, typ=None):
                     continue
                 hdrs = s.get("headers") or {}
                 referer = hdrs.get("referer") or hdrs.get("Referer")
-                # ryuk's animegg MP4 REQUIRES Referer: https://animegg.org/ or it 500s
-                # on the redirect. The API omits headers for ryuk, so hardcode it.
-                if srv == "ryuk" and referer is None:
-                    referer = "https://animegg.org/"
                 is_m = bool(s.get("isM3U8", True)) or url.endswith(".m3u8")
                 fmt = "mp4" if not is_m else "hls"
+            else:
+                # ryuk: resolve OURSELVES from animegg (just4anime's ryuk is
+                # mislabeled/unavailable for many shows). Use just4anime's
+                # episode.id slug if present + the anime title as fallback.
+                j4_slug = (data.get("episode") or {}).get("id") if data else None
+                url, referer = _ryuk_real(anilist_id, episode, j4_slug, title)
+                if not url:
+                    continue
+                fmt, is_m = "mp4", False
             subs = []
-            for sub in data.get("subtitles") or []:
+            for sub in (data.get("subtitles") if data else []) or []:
                 fu = sub.get("url")
                 if fu:
                     subs.append({"file": fu, "label": sub.get("lang") or "English"})

@@ -51,8 +51,9 @@ def stream(anilist_id):
     typ = request.args.get("type", "sub")
     if not server:
         return jsonify({"error": "missing 'server'"}), 400
+    title = request.args.get("title", "")
     try:
-        results = resolve(anilist_id, ep, server, typ)
+        results = resolve(anilist_id, ep, server, typ, title=title)
         if not results:
             return jsonify({"error": f"no stream for {server}/{typ} ep{ep} "
                                     f"(source not available on just4anime)"}), 404
