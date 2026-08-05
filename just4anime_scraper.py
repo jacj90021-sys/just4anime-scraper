@@ -107,22 +107,31 @@ def _animegg_slug_from_title(title):
     return s or None
 
 
-def _ryuk_real(anilist_id, episode, just4_id_slug, title):
-    """Return (mp4_url, referer) for the CORRECT animegg episode, or (None, None)."""
+def _ryuk_real(anilist_id, episode, just4_id_slug, title, typ="sub"):
+    """Return (mp4_url, referer) for the CORRECT animegg episode + type, or (None, None).
+
+    animegg episode pages expose separate mirrors per type via tabs:
+      data-version="raw"    -> RAW
+      data-version="subbed" -> SUB
+      data-version="dubbed" -> DUB
+    We pick the embed whose data-version matches the requested typ, so ryuk/sub
+    and ryuk/dub return the correct mirror (not a random/untyped one).
+    """
     referer = "https://animegg.org/"
-    # Build candidate series slugs:
-    #   1) from just4anime's episode.id (strip -episode-N / $ep-N)
-    #   2) from the anime title
+    want = {"sub": "subbed", "dub": "dubbed", "raw": "raw",
+            "hsub": "subbed"}.get(typ, "subbed")
+    # Build candidate series slugs (prefer just4anime's slug, then title-based).
     candidates = []
     if just4_id_slug:
-        base = re.split(r"(?:-episode-|\$ep-|\-ep\d|/ep)", just4_id_slug)[0]
+        base = re.split(r"(?:-episode-|\$ep-|\\-ep\d|/ep)", just4_id_slug)[0]
         base = base.strip("-$").strip()
         if base and "your-name" not in base and "kimi-no-na-wa" not in base:
             candidates.append(base)
     tslug = _animegg_slug_from_title(title)
     if tslug:
-        candidates += [tslug, tslug + "-tv", tslug + "-dub", re.sub(r"[:.]", "", tslug)]
-    # de-dup, keep order
+        # Prefer the "-tv" slug FIRST: it carries the typed raw/sub/dub mirror tabs.
+        # Base slug often only has a single untyped embed, so try -tv before it.
+        candidates += [tslug + "-tv", tslug, tslug + "-dub", re.sub(r"[:.]", "", tslug)]
     seen, ordered = set(), []
     for c in candidates:
         if c and c not in seen:
@@ -134,12 +143,26 @@ def _ryuk_real(anilist_id, episode, just4_id_slug, title):
                         referer=referer)
         except Exception:
             continue
-        m = re.search(r"/embed/(\d+)", page)
-        if not m:
-            continue
-        embed_id = m.group(1)
+        # Collect every mirror tab: data-id + data-version.
+        mirrors = re.findall(
+            r'data-id=[\'"](\d+)[\'"]\s+data-mirror=[\'"][^\'"]*[\'"]\s+data-version=[\'"]([^\'"]+)[\'"]',
+            page)
+        if not mirrors:
+            m = re.search(r"/embed/(\d+)", page)
+            if m:
+                mirrors = [(m.group(1), "subbed")]
+            else:
+                continue
+        # Prefer the mirror matching the requested type.
+        chosen = next((e for e, v in mirrors if v == want), None)
+        if chosen is None:
+            # This slug had typed tabs but none matched our type (e.g. no dub) ->
+            # keep looking at other slugs rather than returning a wrong-type mirror.
+            if len(mirrors) > 1:
+                continue
+            chosen = mirrors[0][0]
         try:
-            emb = _get(f"https://www.animegg.org/embed/{embed_id}", referer=referer)
+            emb = _get(f"https://www.animegg.org/embed/{chosen}", referer=referer)
         except Exception:
             continue
         mp = re.search(r"/play/(\d+)/video\.mp4\?for=(\d+)", emb)
@@ -184,8 +207,9 @@ def resolve(anilist_id, episode, server=None, typ=None, title=None):
                 # ryuk: resolve OURSELVES from animegg (just4anime's ryuk is
                 # mislabeled/unavailable for many shows). Use just4anime's
                 # episode.id slug if present + the anime title as fallback.
+                # typ selects the correct mirror (sub/dub/raw).
                 j4_slug = (data.get("episode") or {}).get("id") if data else None
-                url, referer = _ryuk_real(anilist_id, episode, j4_slug, title)
+                url, referer = _ryuk_real(anilist_id, episode, j4_slug, title, typ)
                 if not url:
                     continue
                 fmt, is_m = "mp4", False
