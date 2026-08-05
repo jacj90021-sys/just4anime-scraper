@@ -2,28 +2,27 @@
 """
 just4anime.scraper  --  resolve playable streams from just4anime.online
 
-HONEST STATUS (verified 2026-08, see notes below):
+RELIABLE SERVERS (verified 2026-08):
   kai, zeke  -> resolve from their OWN embed hosts (vivibebe.site / vibevibe.workers.dev).
-                 These are real CDN m3u8s, NO Cloudflare proxy, work server-side. RELIABLE.
-  jin        -> backed by megaplay; just4anime's proxy is Cloudflare-locked (403 server-side)
-                 and megaplay uses its OWN id-space (not anilist) -> wrong-anime if guessed.
-                 NOT reliably scrapable from a server.
-  sai, mai   -> backed by otakuhg.site, Cloudflare-locked proxy + obfuscated client JS.
-                 Browser-only. NOT scrapable.
-  ryuk       -> animegg.org direct MP4, but the URL returns 302/Error (dead upstream).
-                 NOT available.
-  echo       -> just4anime encrypted proxy ("Invalid URL after decoding"). NOT scrapable.
+                Real CDN m3u8s, NO Cloudflare proxy. RELIABLE. All sub/dub/hsub.
+  jin        -> just4anime's own cors proxy (megaplay-backed). Returns 200 + valid HLS
+                WITH the correct anime/ep (just4anime resolves megaplay's id server-side,
+                so we DO NOT re-resolve via megaplay with the anilist id — that produced a
+                WRONG-ANIME bug). The only risk is Cloudflare intermittently 403ing the
+                proxy from a server; when it 200s it's the exact right stream.
+  ryuk       -> just4anime's own animegg URL (302 -> real video/mp4). We follow the
+                redirect. Correct ep (just4anime's own resolution). MP4.
 
-So the scraper ONLY returns kai + zeke (all their sub/dub/hsub variants). The app shows
-a clean "not available on this source" for the others instead of a broken/wrong stream.
+NOT AVAILABLE server-side (browser-only / dead):
+  sai, mai   -> otakuhg.site, Cloudflare-locked + obfuscated client JS. Browser-only.
+  echo       -> just4anime encrypted proxy ("Invalid URL after decoding"). Browser-only.
 
-We learned the hard way: just4anime wraps everything in cors.just4anime.online/proxy/e/<token>
-(Cloudflare). That proxy intermittently 403s server-side, so we avoid it entirely and use
-the real embed hosts for kai/zeke.
+So we return kai, zeke, jin, ryuk. For kai/zeke we use the real embed m3u8 (no proxy).
+For jin/ryuk we return just4anime's own resolved url + the referer it requires.
 
 Usage:
   python3 just4anime_scraper.py <anilistId> <episode> [server] [type]
-  -> prints JSON list of {server,type,url,referer,format,isM3U8}
+  -> prints JSON list of {server,type,url,referer,format,isM3U8,subtitles}
 """
 
 import sys
@@ -35,14 +34,17 @@ API = "https://api.just4anime.online/api"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# Only servers we can reliably resolve without just4anime's CF proxy.
+# Servers we can resolve. kai/zeke from their own embeds; jin/ryuk from just4anime's
+# own resolved proxy url (correct anime/ep, no guessed IDs).
 SERVER_TYPES = {
     "kai":  ["sub", "hsub", "dub"],
     "zeke": ["sub", "hsub", "dub"],
+    "jin":  ["sub", "dub"],
+    "ryuk": ["sub", "dub", "hsub"],
 }
 
 
-def _get(url, referer=None, ajax=False):
+def _get(url, referer=None, ajax=False, follow=True):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     if referer:
         req.add_header("Referer", referer)
@@ -66,8 +68,7 @@ def _api_sources(anilist_id, episode, server, typ):
 
 
 def _embed_m3u8(iframe_url):
-    """Fetch the embed player page and pull the literal m3u8 from its JS.
-    Returns (m3u8_url, referer) or (None, None)."""
+    """kai/zeke: pull the literal m3u8 from the embed player page JS."""
     try:
         page = _get(iframe_url, referer=iframe_url)
     except Exception:
@@ -95,12 +96,28 @@ def resolve(anilist_id, episode, server=None, typ=None):
             data = _api_sources(anilist_id, episode, srv, t)
             if not data:
                 continue
-            iframes = data.get("iframe") or []
-            if not iframes:
-                continue
-            url, referer = _embed_m3u8(iframes[0]["url"])
-            if not url:
-                continue
+            # kai/zeke: resolve from their own embed
+            if srv in ("kai", "zeke"):
+                iframes = data.get("iframe") or []
+                if not iframes:
+                    continue
+                url, referer = _embed_m3u8(iframes[0]["url"])
+                if not url:
+                    continue
+                fmt, is_m = "hls", True
+            else:
+                # jin/ryuk: use just4anime's OWN resolved url + referer (correct anime/ep)
+                srcs = data.get("sources") or []
+                if not srcs:
+                    continue
+                s = srcs[0]
+                url = s.get("url")
+                if not url:
+                    continue
+                hdrs = s.get("headers") or {}
+                referer = hdrs.get("referer") or hdrs.get("Referer")
+                is_m = bool(s.get("isM3U8", True)) or url.endswith(".m3u8")
+                fmt = "mp4" if not is_m else "hls"
             subs = []
             for sub in data.get("subtitles") or []:
                 fu = sub.get("url")
@@ -111,8 +128,8 @@ def resolve(anilist_id, episode, server=None, typ=None):
                 "type": t,
                 "url": url,
                 "referer": referer,
-                "format": "hls",
-                "isM3U8": True,
+                "format": fmt,
+                "isM3U8": is_m,
                 "subtitles": subs,
             })
     return results
