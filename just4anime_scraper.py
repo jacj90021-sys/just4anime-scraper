@@ -116,6 +116,10 @@ def resolve(anilist_id, episode, server=None, typ=None):
                     continue
                 hdrs = s.get("headers") or {}
                 referer = hdrs.get("referer") or hdrs.get("Referer")
+                # ryuk's animegg MP4 REQUIRES Referer: https://animegg.org/ or it 500s
+                # on the redirect. The API omits headers for ryuk, so hardcode it.
+                if srv == "ryuk" and referer is None:
+                    referer = "https://animegg.org/"
                 is_m = bool(s.get("isM3U8", True)) or url.endswith(".m3u8")
                 fmt = "mp4" if not is_m else "hls"
             subs = []
