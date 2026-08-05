@@ -10,14 +10,19 @@ RELIABLE SERVERS (verified 2026-08):
                 so we DO NOT re-resolve via megaplay with the anilist id — that produced a
                 WRONG-ANIME bug). The only risk is Cloudflare intermittently 403ing the
                 proxy from a server; when it 200s it's the exact right stream.
-  ryuk       -> just4anime's own animegg URL (302 -> real video/mp4). We follow the
-                redirect. Correct ep (just4anime's own resolution). MP4.
+  ryuk       -> resolved OURSELVES from animegg.org (just4anime's own animegg mapping
+                is mislabeled for some shows). We pick the correct typed mirror (sub/dub).
+                MP4, Referer https://animegg.org/.
+
+  sai, mai   -> otakuhg.site obfuscated jwplayer. The iframe runs a packed eval() that
+                resolves the real m3u8 (served as master.txt on a random *.site/*.space CDN).
+                We extract the packed script and run it via node to recover the URL.
+                Referer https://otakuhg.site/. WORKS server-side (needs node).
 
 NOT AVAILABLE server-side (browser-only / dead):
-  sai, mai   -> otakuhg.site, Cloudflare-locked + obfuscated client JS. Browser-only.
   echo       -> just4anime encrypted proxy ("Invalid URL after decoding"). Browser-only.
 
-So we return kai, zeke, jin, ryuk. For kai/zeke we use the real embed m3u8 (no proxy).
+So we return kai, zeke, jin, ryuk, sai, mai.
 For jin/ryuk we return just4anime's own resolved url + the referer it requires.
 
 Usage:
@@ -28,6 +33,8 @@ Usage:
 import sys
 import json
 import re
+import os
+import subprocess
 import urllib.request
 
 API = "https://api.just4anime.online/api"
@@ -38,11 +45,14 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # own resolved proxy url (correct anime/ep, no guessed IDs).
 # ryuk: resolved OURSELVES from animegg.org (just4anime's ryuk mapping is
 # mislabeled upstream for some shows -> wrong anime). See _ryuk_real().
+# sai/mai: otakuhg.site obfuscated jwplayer -> decoded via node. See _otakuhg_m3u8().
 SERVER_TYPES = {
     "kai":  ["sub", "hsub", "dub"],
     "zeke": ["sub", "hsub", "dub"],
     "jin":  ["sub", "dub"],
     "ryuk": ["sub", "dub", "hsub"],
+    "sai":  ["sub", "dub"],
+    "mai":  ["sub", "dub"],
 }
 
 
@@ -86,6 +96,70 @@ def _embed_m3u8(iframe_url):
     if head.strip().startswith("#EXTM3U"):
         host = re.search(r"https?://([^/]+)", iframe_url).group(1)
         return u, "https://" + host
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# sai/mai: otakuhg.site obfuscated jwplayer. The iframe page runs a packed
+# eval() that resolves the real m3u8 (served as master.txt on a random
+# *.site/*.space CDN). We extract the packed script and run it via node to
+# recover the stream URL. Referer must be https://otakuhg.site/.
+# ---------------------------------------------------------------------------
+import shutil
+
+def _otakuhg_m3u8(iframe_url):
+    """Return (m3u8_url, referer) for an otakuhg iframe, or (None, None)."""
+    referer = "https://otakuhg.site/"
+    try:
+        page = _get(iframe_url, referer=referer)
+    except Exception:
+        return None, None
+    i = page.find("eval(function(p,a,c,k,e,d){")
+    if i < 0:
+        return None, None
+    # Extract balanced-paren eval block
+    j, depth, instr = i + 4, 0, None
+    while j < len(page):
+        ch = page[j]
+        if instr:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == instr:
+                instr = None
+            j += 1
+            continue
+        if ch in ('"', "'"):
+            instr = ch
+            j += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                block = page[i:j + 1]
+                break
+        j += 1
+    else:
+        return None, None
+    node = shutil.which("node")
+    if not node:
+        return None, None
+    try:
+        tf = "/tmp/otakuhg_%s.js" % abs(hash(iframe_url))
+        with open(tf, "w") as f:
+            f.write(block)
+        r = subprocess.run([node, os.path.join(os.path.dirname(__file__),
+                                                "otakuhg_decode.js"), tf],
+                           capture_output=True, text=True, timeout=25)
+        for line in r.stdout.splitlines():
+            if line.startswith("SETUP_FILE:"):
+                url = line[len("SETUP_FILE:"):]
+                if url and url != "NONE":
+                    return url, referer
+    except Exception:
+        pass
     return None, None
 
 
@@ -203,6 +277,16 @@ def resolve(anilist_id, episode, server=None, typ=None, title=None):
                 referer = hdrs.get("referer") or hdrs.get("Referer")
                 is_m = bool(s.get("isM3U8", True)) or url.endswith(".m3u8")
                 fmt = "mp4" if not is_m else "hls"
+            elif srv in ("sai", "mai"):
+                # otakuhg.site obfuscated jwplayer -> decode via node.
+                iframes = (data or {}).get("iframe") or []
+                if not iframes:
+                    continue
+                url, referer = _otakuhg_m3u8(iframes[0]["url"])
+                if not url:
+                    continue
+                is_m = url.endswith(".m3u8") or "master" in url or ".txt" in url
+                fmt = "hls" if is_m else "mp4"
             else:
                 # ryuk: resolve OURSELVES from animegg (just4anime's ryuk is
                 # mislabeled/unavailable for many shows). Use just4anime's
