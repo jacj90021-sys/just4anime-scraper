@@ -34,13 +34,14 @@ API = "https://api.just4anime.online/api"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# Servers we can resolve. kai/zeke from their own embeds; jin/ryuk from just4anime's
+# Servers we can resolve. kai/zeke from their own embeds; jin from just4anime's
 # own resolved proxy url (correct anime/ep, no guessed IDs).
+# ryuk DROPPED: just4anime's ryuk->animegg mapping is mislabeled upstream
+# (e.g. Black Clover ep1 returns the "Your Name" movie). Plays, but wrong anime.
 SERVER_TYPES = {
     "kai":  ["sub", "hsub", "dub"],
     "zeke": ["sub", "hsub", "dub"],
     "jin":  ["sub", "dub"],
-    "ryuk": ["sub", "dub", "hsub"],
 }
 
 
